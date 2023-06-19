@@ -1,0 +1,14 @@
+.github
+.idea
+.nyc_output
+.jsdoc.json
+.travis.yml
+greenkeeper.json
+coverage
+docs
+examples
+test
+xlsx
+logos
+CODE_OF_CONDUCT.md
+fast-formula-parser-*

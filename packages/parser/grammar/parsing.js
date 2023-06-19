@@ -1,0 +1,538 @@
+const { EmbeddedActionsParser } = require('chevrotain');
+const lexer = require('./lexing');
+
+const { tokenVocabulary } = lexer;
+const Helpers = require('./helpers');
+
+const {
+  At,
+  String,
+  SheetQuoted,
+  ExcelRefFunction,
+  ExcelConditionalRefFunction,
+  Function,
+  FormulaErrorT,
+  RefError,
+  Cell,
+  Sheet,
+  Name,
+  Number,
+  Boolean,
+  Column,
+  TableName,
+  ColumnName,
+  SpecialItem,
+
+  // At,
+  Comma,
+  Colon,
+  Semicolon,
+  OpenParen,
+  CloseParen,
+  OpenSquareParen,
+  CloseSquareParen,
+  // ExclamationMark,
+  OpenCurlyParen,
+  CloseCurlyParen,
+  MulOp,
+  PlusOp,
+  DivOp,
+  MinOp,
+  ConcatOp,
+  ExOp,
+  PercentOp,
+  NeqOp,
+  GteOp,
+  LteOp,
+  GtOp,
+  EqOp,
+  LtOp,
+} = lexer.tokenVocabulary;
+
+class Parsing extends EmbeddedActionsParser {
+  /**
+   *
+   * @param {FormulaParser|DepParser} context
+   * @param {Utils} utils
+   */
+  constructor(context, utils) {
+    super(tokenVocabulary, {
+      outputCst: false,
+      maxLookahead: 1,
+      skipValidations: true,
+      // traceInitPerf: true,
+    });
+
+    this.utils = utils;
+    this.binaryOperatorsPrecedence = [
+      ['^'],
+      ['*', '/'],
+      ['+', '-'],
+      ['&'],
+      ['<', '>', '=', '<>', '<=', '>='],
+    ];
+    const $ = this;
+
+    // Adopted from https://github.com/spreadsheetlab/XLParser/blob/master/src/XLParser/ExcelFormulaGrammar.cs
+
+    $.RULE('formulaWithBinaryOp', () => {
+      const infixes = [];
+      const values = [$.SUBRULE($.formulaWithPercentOp)];
+      $.MANY(() => {
+        // Caching Arrays of Alternatives
+        // https://sap.github.io/chevrotain/docs/guide/performance.html#caching-arrays-of-alternatives
+        infixes.push(
+          $.OR(
+            $.c1 ||
+              ($.c1 = [
+                { ALT: () => $.CONSUME(GtOp).image },
+                { ALT: () => $.CONSUME(EqOp).image },
+                { ALT: () => $.CONSUME(LtOp).image },
+                { ALT: () => $.CONSUME(NeqOp).image },
+                { ALT: () => $.CONSUME(GteOp).image },
+                { ALT: () => $.CONSUME(LteOp).image },
+                { ALT: () => $.CONSUME(ConcatOp).image },
+                { ALT: () => $.CONSUME(PlusOp).image },
+                { ALT: () => $.CONSUME(MinOp).image },
+                { ALT: () => $.CONSUME(MulOp).image },
+                { ALT: () => $.CONSUME(DivOp).image },
+                { ALT: () => $.CONSUME(ExOp).image },
+              ])
+          )
+        );
+        values.push($.SUBRULE2($.formulaWithPercentOp));
+      });
+      $.ACTION(() => {
+        // evaluate
+        for (const ops of this.binaryOperatorsPrecedence) {
+          for (let index = 0, { length } = infixes; index < length; index++) {
+            const infix = infixes[index];
+            if (!ops.includes(infix)) continue;
+            infixes.splice(index, 1);
+            values.splice(
+              index,
+              2,
+              this.utils.applyInfix(values[index], infix, values[index + 1])
+            );
+            index--;
+            length--;
+          }
+        }
+      });
+
+      return values[0];
+    });
+
+    $.RULE('plusMinusOp', () =>
+      $.OR([
+        { ALT: () => $.CONSUME(PlusOp).image },
+        { ALT: () => $.CONSUME(MinOp).image },
+      ])
+    );
+
+    $.RULE('formulaWithPercentOp', () => {
+      let value = $.SUBRULE($.formulaWithUnaryOp);
+      $.OPTION(() => {
+        const postfix = $.CONSUME(PercentOp).image;
+        value = $.ACTION(() => this.utils.applyPostfix(value, postfix));
+      });
+      return value;
+    });
+
+    $.RULE('formulaWithUnaryOp', () => {
+      // support ++---3 => -3
+      const prefixes = [];
+      $.MANY(() => {
+        const op = $.OR([
+          { ALT: () => $.CONSUME(PlusOp).image },
+          { ALT: () => $.CONSUME(MinOp).image },
+        ]);
+        prefixes.push(op);
+      });
+      const formula = $.SUBRULE($.formulaWithIntersect);
+      if (prefixes.length > 0)
+        return $.ACTION(() => this.utils.applyPrefix(prefixes, formula));
+      return formula;
+    });
+
+    $.RULE('formulaWithIntersect', () => {
+      // e.g.  'A1 A2 A3'
+      const ref1 = $.SUBRULE($.formulaWithRange);
+      const refs = [ref1];
+      // console.log('check intersect')
+      $.MANY({
+        GATE: () => {
+          // see https://github.com/SAP/chevrotain/blob/master/examples/grammars/css/css.js#L436-L441
+          const prevToken = $.LA(0);
+          const nextToken = $.LA(1);
+          //  This is the only place where the grammar is whitespace sensitive.
+          return nextToken.startOffset > prevToken.endOffset + 1;
+        },
+        DEF: () => {
+          refs.push($.SUBRULE3($.formulaWithRange));
+        },
+      });
+      if (refs.length > 1) {
+        return $.ACTION(() => $.ACTION(() => this.utils.applyIntersect(refs)));
+      }
+      return ref1;
+    });
+
+    $.RULE('formulaWithRange', () => {
+      // e.g. 'A1:C3' or 'A1:A3:C4', can be any number of references, at lease 2
+      const ref1 = $.SUBRULE($.formula);
+      const refs = [ref1];
+      $.MANY(() => {
+        $.CONSUME(Colon);
+        refs.push($.SUBRULE2($.formula));
+      });
+      if (refs.length > 1) {
+        return $.ACTION(() => $.ACTION(() => this.utils.applyRange(refs)));
+      }
+      return ref1;
+    });
+
+    $.RULE('formula', () =>
+      $.OR9([
+        { ALT: () => $.SUBRULE($.referenceWithoutInfix) },
+        { ALT: () => $.SUBRULE($.paren) },
+        { ALT: () => $.SUBRULE($.constant) },
+        { ALT: () => $.SUBRULE($.functionCall) },
+        { ALT: () => $.SUBRULE($.multiArray) },
+      ])
+    );
+
+    $.RULE('paren', () => {
+      // formula paren or union paren
+      $.CONSUME(OpenParen);
+      let result;
+      const refs = [];
+      refs.push($.SUBRULE($.formulaWithBinaryOp));
+      $.MANY(() => {
+        $.CONSUME(Comma);
+        refs.push($.SUBRULE2($.formulaWithBinaryOp));
+      });
+      if (refs.length > 1) {
+        result = $.ACTION(() => this.utils.applyUnion(refs));
+      } else {
+        result = refs[0];
+      }
+
+      $.CONSUME(CloseParen);
+      return result;
+    });
+
+    $.RULE('multiArray', () => {
+      const multiArr = [[]];
+      let singleArr = null;
+
+      $.CONSUME(OpenCurlyParen);
+      const single = $.OR([
+        {
+          ALT: () => {
+            Helpers.mergeArrays(multiArr, $.SUBRULE($.functionCall));
+            return false;
+          },
+        },
+        {
+          ALT: () => {
+            singleArr = $.SUBRULE($.constantArray);
+            $.CONSUME(CloseCurlyParen);
+            return true;
+          },
+        },
+        {
+          ALT: () => {
+            Helpers.mergeArrays(multiArr, $.SUBRULE($.subArray));
+            return false;
+          },
+        },
+      ]);
+      // chevrotain occasionally runs simulations where $.OR returns as
+      // "{description: 'This Object indicates the Parser is during Recording Phase'}"
+      // thus we need to check if single === true
+      if (single === true) {
+        return $.ACTION(() => this.utils.toArray(singleArr));
+      }
+      $.MANY(() => {
+        $.CONSUME(Comma);
+        const x = $.OR2([
+          {
+            ALT: () => {
+              Helpers.mergeArrays(multiArr, $.SUBRULE($.subArray));
+            },
+          },
+          {
+            ALT: () => {
+              Helpers.mergeArrays(multiArr, $.SUBRULE($.functionCall));
+            },
+          },
+        ]);
+      });
+      $.CONSUME(CloseCurlyParen);
+      return $.ACTION(() => this.utils.toArray(multiArr));
+    });
+
+    $.RULE('subArray', () => {
+      $.CONSUME(OpenCurlyParen);
+      const subArray = $.SUBRULE2($.constantArray);
+      if (subArray.length > 1) {
+        throw 'Error: 3D Array';
+      }
+      $.CONSUME(CloseCurlyParen);
+      return $.ACTION(() => this.utils.toArray(subArray));
+    });
+
+    $.RULE('constantArray', () => {
+      // console.log('constantArray');
+      const arr = [[]];
+      let currentRow = 0;
+      // array must contain at least one item
+      arr[currentRow].push($.SUBRULE($.constantForArray));
+      $.MANY(() => {
+        const sep = $.OR([
+          { ALT: () => $.CONSUME(Comma).image },
+          { ALT: () => $.CONSUME(Semicolon).image },
+        ]);
+        const constant = $.SUBRULE2($.constantForArray);
+        if (sep === ',') {
+          arr[currentRow].push(constant);
+        } else {
+          currentRow++;
+          arr[currentRow] = [];
+          arr[currentRow].push(constant);
+        }
+      });
+      return $.ACTION(() => this.utils.toArray(arr));
+    });
+
+    /**
+     * Used in array
+     */
+    $.RULE('constantForArray', () =>
+      $.OR([
+        {
+          ALT: () => {
+            const prefix = $.OPTION(() => $.SUBRULE($.plusMinusOp));
+            const { image } = $.CONSUME(Number);
+            const number = $.ACTION(() => this.utils.toNumber(image));
+            if (prefix) {
+              return $.ACTION(() => this.utils.applyPrefix([prefix], number));
+            }
+            return number;
+          },
+        },
+        {
+          ALT: () => {
+            const str = $.CONSUME(String).image;
+            return $.ACTION(() => this.utils.toString(str));
+          },
+        },
+        {
+          ALT: () => {
+            const bool = $.CONSUME(Boolean).image;
+            return $.ACTION(() => this.utils.toBoolean(bool));
+          },
+        },
+        {
+          ALT: () => {
+            const err = $.CONSUME(FormulaErrorT).image;
+            return $.ACTION(() => this.utils.toError(err));
+          },
+        },
+        {
+          ALT: () => {
+            const err = $.CONSUME(RefError).image;
+            return $.ACTION(() => this.utils.toError(err));
+          },
+        },
+      ])
+    );
+
+    $.RULE('constant', () =>
+      $.OR([
+        {
+          ALT: () => {
+            const number = $.CONSUME(Number).image;
+            return $.ACTION(() => this.utils.toNumber(number));
+          },
+        },
+        {
+          ALT: () => {
+            const str = $.CONSUME(String).image;
+            return $.ACTION(() => this.utils.toString(str));
+          },
+        },
+        {
+          ALT: () => {
+            const bool = $.CONSUME(Boolean).image;
+            return $.ACTION(() => this.utils.toBoolean(bool));
+          },
+        },
+        {
+          ALT: () => {
+            const err = $.CONSUME(FormulaErrorT).image;
+            return $.ACTION(() => this.utils.toError(err));
+          },
+        },
+      ])
+    );
+
+    $.RULE('functionCall', () => {
+      const functionName = $.CONSUME(Function).image.slice(0, -1);
+      // console.log('functionName', functionName);
+      const args = $.SUBRULE($.arguments);
+      $.CONSUME(CloseParen);
+      // dependency parser won't call function.
+      return $.ACTION(() => context.callFunction(functionName, args));
+    });
+
+    $.RULE('arguments', () => {
+      // console.log('try arguments')
+
+      // allows ',' in the front
+      $.MANY2(() => {
+        $.CONSUME2(Comma);
+      });
+      const args = [];
+      // allows empty arguments
+      $.OPTION(() => {
+        args.push($.SUBRULE($.formulaWithBinaryOp));
+        $.MANY(() => {
+          $.CONSUME1(Comma);
+          args.push(null); // e.g. ROUND(1.5,)
+          $.OPTION3(() => {
+            args.pop();
+            args.push($.SUBRULE2($.formulaWithBinaryOp));
+          });
+        });
+      });
+      return args;
+    });
+
+    $.RULE('referenceWithoutInfix', () =>
+      $.OR([
+        { ALT: () => $.SUBRULE($.referenceItem) },
+
+        {
+          // sheet name prefix
+          ALT: () => {
+            // console.log('try sheetName');
+            const sheetName = $.SUBRULE($.prefixName);
+            // console.log('sheetName', sheetName);
+            const referenceItem = $.SUBRULE2($.formulaWithRange);
+
+            $.ACTION(() => {
+              if (this.utils.isFormulaError(referenceItem)) {
+                return referenceItem;
+              }
+              referenceItem.ref.sheet = sheetName;
+            });
+            return referenceItem;
+          },
+        },
+
+        // {ALT: () => $.SUBRULE('dynamicDataExchange')},
+      ])
+    );
+
+    $.RULE('referenceItem', () =>
+      $.OR([
+        {
+          ALT: () => {
+            const address = $.CONSUME(Cell).image;
+            return $.ACTION(() => this.utils.parseCellAddress(address));
+          },
+        },
+        {
+          ALT: () => {
+            const name = $.CONSUME(Name).image;
+            return $.ACTION(() => context.getVariable(name));
+          },
+        },
+        {
+          ALT: () => {
+            const column = $.CONSUME(Column).image;
+            return $.ACTION(() => this.utils.parseCol(column));
+          },
+        },
+        // A row check should be here, but the token is same with Number,
+        // In other to resolve ambiguities, I leave this empty, and
+        // parse the number to row number when needed.
+        {
+          ALT: () => {
+            const err = $.CONSUME(RefError).image;
+            return $.ACTION(() => this.utils.toError(err));
+          },
+        },
+        // {ALT: () => $.SUBRULE($.udfFunctionCall)},
+        { ALT: () => $.SUBRULE($.structuredReference) },
+      ])
+    );
+
+    $.RULE('structuredReference', () => {
+      let tableName;
+      let columnName;
+      let thisRow = false;
+      let specialItem;
+      $.OPTION3(() => {
+        tableName = $.CONSUME(TableName).image.slice(0, -1);
+      });
+
+      $.OPTION(() => {
+        specialItem = $.CONSUME(SpecialItem).image;
+        specialItem = specialItem.replace(/\[|\]|\,/gi, '');
+      });
+
+      columnName = $.SUBRULE($.columnNameWithRange);
+
+      return $.ACTION(() => {
+        if (Array.isArray(columnName)) {
+          columnName = columnName.map((name) => name.replace(/\@|\[|\]/gi, ''));
+        } else {
+          thisRow = columnName.indexOf('@') !== -1;
+          columnName = columnName.replace(/\@|\[|\]/gi, '');
+        }
+        return context.getStructuredReference(
+          tableName,
+          columnName,
+          thisRow,
+          specialItem
+        );
+      });
+    });
+
+    $.RULE('tableColumnName', () => $.CONSUME(ColumnName).image);
+
+    // TODO Support range columns
+    $.RULE('columnNameWithRange', () => {
+      // e.g. 'A1:C3' or 'A1:A3:C4', can be any number of references, at lease 2
+      const ref1 = $.SUBRULE($.tableColumnName);
+      const refs = [ref1];
+      $.MANY(() => {
+        $.CONSUME(Colon);
+        refs.push($.SUBRULE2($.tableColumnName));
+      });
+      if (refs.length > 1) {
+        return $.ACTION(() => $.ACTION(() => refs));
+      }
+      return ref1;
+    });
+
+    $.RULE('prefixName', () =>
+      $.OR([
+        { ALT: () => $.CONSUME(Sheet).image.slice(0, -1) },
+        {
+          ALT: () =>
+            $.CONSUME(SheetQuoted).image.slice(1, -2).replace(/''/g, "'"),
+        },
+      ])
+    );
+
+    this.performSelfAnalysis();
+  }
+}
+
+module.exports = {
+  Parser: Parsing,
+};
